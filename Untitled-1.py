@@ -1,5 +1,6 @@
 # %%
 import sys
+import threading
 import time
 import cv2
 import math
@@ -8,7 +9,7 @@ import onnxruntime
 import numpy as np
 import pyclipper
 from shapely.geometry import Polygon
-
+model_shape_w = 48
 # %%
 class NormalizeImage(object):
     """ normalize image such as substract mean, divide std
@@ -104,7 +105,7 @@ class DetResizeForTest(object):
 
     def image_padding(self, im, value=0):
         h, w, c = im.shape
-        im_pad = np.zeros((max(32, h), max(32, w), c), np.uint8) + value
+        im_pad = np.zeros((max(model_shape_w, h), max(model_shape_w, w), c), np.uint8) + value
         im_pad[:h, :w, :] = im
         return im_pad
 
@@ -119,8 +120,8 @@ class DetResizeForTest(object):
         ori_h, ori_w = img.shape[:2]  # (h, w, c)
         if self.keep_ratio is True:
             resize_w = ori_w * resize_h / ori_h
-            N = math.ceil(resize_w / 32)
-            resize_w = N * 32
+            N = math.ceil(resize_w / model_shape_w)
+            resize_w = N * model_shape_w
         ratio_h = float(resize_h) / ori_h
         ratio_w = float(resize_w) / ori_w
       
@@ -130,7 +131,7 @@ class DetResizeForTest(object):
 
     def resize_image_type0(self, img):
         """
-        resize image to a size multiple of 32 which is required by the network
+        resize image to a size multiple of 48 which is required by the network
         args:
             img(array): array with shape [h, w, c]
         return(tuple):
@@ -163,8 +164,8 @@ class DetResizeForTest(object):
         resize_h = int(h * ratio)
         resize_w = int(w * ratio)
 
-        resize_h = max(int(round(resize_h / 32) * 32), 32)
-        resize_w = max(int(round(resize_w / 32) * 32), 32)
+        resize_h = max(int(round(resize_h / model_shape_w) * model_shape_w), model_shape_w)
+        resize_w = max(int(round(resize_w / model_shape_w) * model_shape_w), model_shape_w)
 
         try:
             if int(resize_w) <= 0 or int(resize_h) <= 0:
@@ -381,11 +382,13 @@ class process_pred(object):
 
 # %%
 class det_rec_functions(object):
-    def __init__(self, image,use_dnn = False):
+    def __init__(self, image,use_dnn = False,version=3):
+        global model_shape_w
         self.img = image.copy()
-        self.det_file = './model1/det_model.onnx'
-        self.small_rec_file = './model1/rec_model.onnx'
-        self.model_shape = [3,32,1000]
+        self.det_file = './modelv{}/det_model.onnx'.format(version)
+        self.small_rec_file = './modelv{}/rec_model.onnx'.format(version)
+        model_shape_w = 48 if version == 3 else 32 # 适配v2和v3
+        self.model_shape = [3,model_shape_w,1000]
         self.use_dnn = use_dnn
         if self.use_dnn == False:
             self.onet_det_session = onnxruntime.InferenceSession(self.det_file)
@@ -607,8 +610,17 @@ class det_rec_functions(object):
             outs = onnx_model.run(None, inputs)
             outs = outs[0]
         return process_op(outs)
-
+    
+    def process_n_pic(self,piclist):
+        results = []
+        results_info = []
+        for pic in piclist:
+            res = self.get_img_res(self.onet_rec_session, pic, self.postprocess_op)
+            results.append(res[0])
+            results_info.append(res)
+            
     def recognition_img(self, dt_boxes):
+        stime = time.time()
         img_ori = self.img  #原图大小
         img = img_ori.copy()
         img_list = []
@@ -616,7 +628,8 @@ class det_rec_functions(object):
             tmp_box = copy.deepcopy(box)
             img_crop = self.get_rotate_crop_image(img, tmp_box)
             img_list.append(img_crop)
-
+        ptime = time.time()
+        print("rec preprocess time",ptime-stime)
         ## 识别小图片
         results = []
         results_info = []
@@ -624,13 +637,29 @@ class det_rec_functions(object):
             res = self.get_img_res(self.onet_rec_session, pic, self.postprocess_op)
             results.append(res[0])
             results_info.append(res)
+        # threads = []
+        # tmp_img = []
+        # for i, pic in enumerate(img_list):
+        #     tmp_img.append(pic)
+        #     if len(tmp_img)==116 or i == len(img_list)-1:
+        #         print("process len",len(tmp_img))
+        #         thread = threading.Thread(target=self.process_n_pic,args=(copy.deepcopy(tmp_img),))
+        #         thread.start()
+        #         threads.append(thread)
+        #         tmp_img = []
+        # print("waiting..")
+        # # 等待所有线程执行完毕
+        # for thread in threads:
+        #     thread.join()
+            
+        print("rec end time",time.time()-ptime)
         return results, results_info
 
 
 # %%
 if __name__=='__main__':
     # 读取图片
-    image = cv2.imread('./00.png')
+    image = cv2.imread('./11.png')
     # 文本检测
     # 模型固化为640*640 需要修改对应前处理，box的后处理。
     # ocr_sys = det_rec_functions(image,use_dnn = True)
@@ -642,15 +671,19 @@ if __name__=='__main__':
     # results, results_info = ocr_sys.recognition_img(dt_boxes)
     # print(f'opencv dnn :{str(results)}')
     # print('------------------------------')
-    ocr_sys = det_rec_functions(image,use_dnn = False)
+    
+    ocr_sys = det_rec_functions(image,use_dnn = False,version=3)
+    stime = time.time()
     # 得到检测框
     dt_boxes = ocr_sys.get_boxes()
-    print(len(dt_boxes))
+    dettime = time.time()
+    print(len(dt_boxes[0]))
     # 识别 results: 单纯的识别结果，results_info: 识别结果+置信度    原图
     # 识别模型固定尺寸只能100长度，需要处理可以根据自己场景导出模型 1000
     # onnx可以支持动态，不受限
     results, results_info = ocr_sys.recognition_img(dt_boxes)
-    print(f'onnxruntime :{str(results)}')
+    print(f'onnxruntime :{str(results)}',results_info)
+    print(time.time()-dettime,dettime - stime)
 
 
 
